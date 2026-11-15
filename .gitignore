@@ -6,3 +6,12 @@ logs/
 __pycache__/
 *.pyc
 .DS_Store
+
+# 防误提交：任何凭据/本地配置一律挡在门外
+.env
+.env.*
+*.key
+*.pem
+*.p12
+config.json
+vocabulary.txt

@@ -1,0 +1,8 @@
+# 运行时/构建产物，不进版本库
+.venv/
+models/
+bin/
+logs/
+__pycache__/
+*.pyc
+.DS_Store

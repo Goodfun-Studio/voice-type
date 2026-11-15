@@ -9,7 +9,7 @@ final class HUD {
     private var dismiss: DispatchWorkItem?
     private var lastLevelAt = Date.distantPast
 
-    private let size = NSSize(width: 240, height: 54)
+    private let size = NSSize(width: 300, height: 54)
 
     func prepare() {
         panel = NSPanel(contentRect: NSRect(origin: .zero, size: size),
@@ -157,10 +157,20 @@ final class HUDView: NSView {
             configured?.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0)
         }
 
+        let hint = "esc 取消"
+        let hintAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.42),
+        ]
+        let hintSize = (hint as NSString).size(withAttributes: hintAttributes)
+        let hintX = bounds.width - hintSize.width - 14
+        (hint as NSString).draw(at: NSPoint(x: hintX, y: bounds.midY - hintSize.height / 2),
+                                withAttributes: hintAttributes)
+
         let barWidth: CGFloat = 3
         let gap: CGFloat = 3
         let startX = iconX + 28
-        let available = bounds.width - startX - 18
+        let available = bounds.width - startX - hintSize.width - 30
         let maxBars = max(1, Int((available + gap) / (barWidth + gap)))
         let shown = Array(levels.suffix(maxBars))
         let maxHeight = bounds.height - 20

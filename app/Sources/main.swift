@@ -71,6 +71,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let minimumSeconds: TimeInterval = 0.3
     private var engineReady = false
     private var trusted = AXIsProcessTrusted()
+    private let cancelHotkey = CarbonHotKey()
+    /// Bumped on every recording, so a late result from an abandoned take can
+    /// never be pasted into whatever the user is doing now.
+    private var generation = 0
+    private var cancelledGeneration = -1
     private var trustTimer: Timer?
 
     func applicationDidFinishLaunching(_ note: Notification) {
@@ -88,6 +93,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         altHotkey.register(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey))
         altHotkey.onFire = { [weak self] in
             DispatchQueue.main.async { self?.toggle() }
+        }
+        // Only live while a recording is in flight — see beginRecordingWindow().
+        cancelHotkey.onFire = { [weak self] in
+            DispatchQueue.main.async { self?.cancel() }
         }
         hotkey.start()
 
@@ -157,6 +166,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         langItem.submenu = langMenu
         menu.addItem(langItem)
 
+        addItem(menu, "取消当前录音 / 转写（Esc）", #selector(cancelCurrent))
+        menu.addItem(.separator())
         addItem(menu, "检查辅助功能权限", #selector(grantAccessibility))
         addItem(menu, "检查麦克风权限", #selector(grantMicrophone))
         menu.addItem(.separator())
@@ -200,8 +211,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .recording:
             finishRecording()
         case .transcribing:
-            NSSound(named: "Basso")?.play()
+            cancel()
         }
+    }
+
+    private func beginRecordingWindow() {
+        // Esc is registered only for the few seconds we are recording, so the
+        // rest of the system keeps its Esc key untouched.
+        if cancelHotkey.register(keyCode: UInt32(kVK_Escape), modifiers: 0) {
+            logLine("take \(generation) started, esc armed")
+        } else {
+            logLine("esc hotkey unavailable, cancel from the menu instead")
+        }
+    }
+
+    private func endRecordingWindow() {
+        guard cancelHotkey.isRegistered else { return }
+        cancelHotkey.unregister()
+        logLine("esc released")
+    }
+
+    private func discard(_ url: URL?) {
+        guard let url else { return }
+        try? FileManager.default.removeItem(at: url)
     }
 
     private func startRecording() {
@@ -219,21 +251,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             grantMicrophone()
             return
         }
+        generation += 1
         startedAt = Date()
         state = .recording
+        beginRecordingWindow()
         hud.showListening()
         refreshStatus()
         if config.sound { NSSound(named: "Tink")?.play() }
     }
 
     private func finishRecording() {
+        guard state == .recording else { return }
+        endRecordingWindow()
         guard let wav = recorder.stop() else { return }
+
         let seconds = Date().timeIntervalSince(startedAt ?? Date())
         state = .transcribing
         refreshStatus()
         if config.sound { NSSound(named: "Pop")?.play() }
 
         guard seconds >= minimumSeconds else {
+            logLine("take too short (\(String(format: "%.2f", seconds))s), discarded")
+            discard(wav)
             hud.hideSoon()
             state = .idle
             refreshStatus()
@@ -241,6 +280,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         hud.showTranscribing()
 
+        let myGeneration = generation
         let language = config.language == "auto" ? nil : config.language
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
@@ -249,18 +289,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let text = (result["text"] as? String) ?? ""
                 let ms = (result["elapsedMs"] as? Int) ?? 0
                 DispatchQueue.main.async {
-                    self.deliver(text, ms: ms)
+                    if self.cancelledGeneration == myGeneration {
+                        logLine("result of take \(myGeneration) discarded after cancel: \(text.prefix(30))")
+                    } else {
+                        self.deliver(text, ms: ms)
+                    }
+                    self.discard(wav)
                     self.state = .idle
                     self.refreshStatus()
                 }
             } catch {
                 logLine("transcribe failed: \(error)")
                 DispatchQueue.main.async {
-                    self.hud.toast("转写失败")
+                    self.discard(wav)
+                    if self.cancelledGeneration != myGeneration { self.hud.toast("转写失败") }
                     self.state = .idle
                     self.refreshStatus()
                 }
             }
+        }
+    }
+
+    /// Esc (or a second double-tap) backs out: the audio is thrown away and
+    /// nothing is transcribed or pasted.
+    private func cancel() {
+        switch state {
+        case .recording:
+            cancelledGeneration = generation
+            endRecordingWindow()
+            discard(recorder.stop())
+            state = .idle
+            refreshStatus()
+            hud.toast("已取消")
+            if config.sound { NSSound(named: "Basso")?.play() }
+            logLine("take \(generation) cancelled, audio discarded")
+        case .transcribing:
+            cancelledGeneration = generation
+            state = .idle
+            refreshStatus()
+            hud.toast("已取消")
+            logLine("transcription of take \(generation) cancelled")
+        case .idle:
+            break
         }
     }
 
@@ -320,6 +390,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
     }
 
+    @objc private func cancelCurrent() { cancel() }
+
     @objc private func grantAccessibility() { openAccessibilityPane() }
 
     @objc private func openAccessibilityPane() {
@@ -377,6 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func quit() { NSApp.terminate(nil) }
 
     func applicationWillTerminate(_ note: Notification) {
+        endRecordingWindow()
         engine?.shutdown()
     }
 }

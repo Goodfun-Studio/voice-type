@@ -175,6 +175,12 @@ def normalize_for_match(text: str) -> str:
 QUIET_RMS = 0.012
 
 
+def has_speech(text: str) -> bool:
+    """False when the transcript carries no actual words — whisper sometimes
+    emits bare punctuation ("……", "。") on a mumble or a stray noise."""
+    return bool(normalize_for_match(text))
+
+
 def is_hallucination(text: str, rms: float | None = None) -> bool:
     """True when the transcript is a known whisper stock phrase.
 
@@ -238,6 +244,10 @@ if __name__ == "__main__":
                  ("谢谢观看", 0.0037),
                  ("我今天下午三点开会，记得请大家点赞订阅转发。", 0.0037)]:
         print(f"  [{'丢' if is_hallucination(c, r) else '留'}] rms={r:.4f}  {c}")
+
+    print("\n空转写判定:")
+    for c in ["……", "。", "  ", "嗯", "好，我删了。"]:
+        print(f"  [{'空' if not has_speech(c) else '有字'}] {c!r}")
 
     print("\n词表纠正:")
     for c in ["然后我们把食鱼那个流程再对一遍", "把照片扣图以后放进鱼刚里", "今天晚饭吃鱼"]:

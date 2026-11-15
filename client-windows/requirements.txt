@@ -1,0 +1,11 @@
+# Voice Type — Windows 客户端依赖
+#
+# 只装客户端自己要用的东西。转写引擎（faster-whisper / ctranslate2 / av …）
+# 的依赖见 ../engine/requirements-windows.txt —— install.ps1 会一并装进同一个 venv。
+#
+# pystray / Pillow 是托盘图标的可选依赖：缺了客户端会退化成无声运行，
+# 不崩（见 README「托盘是可选依赖」）。
+sounddevice>=0.4.6
+numpy>=1.24
+pystray>=0.19
+Pillow>=10.0

@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """Voice Type transcription daemon.
 
-Holds whisper-large-v3-turbo (MLX) warm in memory and answers transcription
-requests over a unix socket. Protocol: one JSON object per line, request then
-one JSON object per line as the response.
+Keeps a whisper model warm in memory and answers transcription requests over a
+local socket. One protocol, two transports:
+
+  unix socket  — macOS default; what the shipped Swift app talks to
+  127.0.0.1 TCP — Windows (and anywhere unix sockets are awkward)
+
+Protocol: one JSON object per line, one request per line, one reply per line.
 
   {"cmd": "ping"}
-  {"cmd": "transcribe", "wav": "/tmp/x.wav", "language": "zh"|"auto"}
+  {"cmd": "transcribe", "wav": "C:\\tmp\\x.wav", "language": "zh"|"auto"}
 
-Run standalone for one-off files with:  engine.py --once file.wav
+The speech model itself lives behind backends.py: Apple MLX on M-series Macs,
+CTranslate2 (faster-whisper) everywhere else. Everything below the backend —
+silence gate, hallucination filter, cleanup rules, vocabulary rewrite — is
+shared by both.
+
+Run standalone for one-off files:  engine.py --once file.wav
 """
 from __future__ import annotations
 
@@ -23,22 +32,9 @@ import wave
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cleanup import apply_vocabulary, clean, has_speech, is_hallucination  # noqa: E402
-
-def _pick_hf_endpoint() -> None:
-    """huggingface.co is unreachable on some networks (and hard-blocked on
-    others); fall back to the mirror when a 2s probe says so."""
-    if os.environ.get("HF_ENDPOINT"):
-        return
-    import socket as _socket
-    try:
-        probe = _socket.create_connection(("huggingface.co", 443), timeout=2.5)
-        probe.close()
-    except OSError:
-        os.environ["HF_ENDPOINT"] = os.environ.get(
-            "VOICETYPE_HF_MIRROR", "https://hf-mirror.com")
-        print("huggingface.co unreachable, using", os.environ["HF_ENDPOINT"], flush=True)
-
+from backends import Backend, choose_backend, ensure_hf_endpoint  # noqa: E402
+from cleanup import (apply_vocabulary, clean, has_speech,  # noqa: E402
+                      is_hallucination, is_prompt_echo)
 
 # A launchd-launched app inherits a bare PATH, so mlx_whisper's ffmpeg shell-out
 # would fail there even though ffmpeg is installed. Make the usual bin dirs visible.
@@ -46,21 +42,28 @@ for _extra in ("/opt/homebrew/bin", "/usr/local/bin"):
     if _extra not in os.environ.get("PATH", ""):
         os.environ["PATH"] = _extra + ":" + os.environ.get("PATH", "")
 
-SUPPORT = Path.home() / "Library/Application Support/VoiceType"
+def _support_dir() -> Path:
+    """Where this tool keeps its own files, per platform. Overridable with
+    VOICETYPE_DIR so tests and the Windows installer can redirect it."""
+    override = os.environ.get("VOICETYPE_DIR")
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "VoiceType"
+    return Path.home() / "Library/Application Support/VoiceType"
+
+
+SUPPORT = _support_dir()
 SOCK = Path(os.environ.get("VOICETYPE_SOCK", SUPPORT / "engine.sock"))
-DEFAULT_MODEL_DIR = Path(__file__).resolve().parent.parent / "models/whisper-large-v3-turbo"
-LOCAL_WEIGHTS = DEFAULT_MODEL_DIR / "weights.safetensors"
+# Clients read this to discover how to reach a running engine, so they never
+# have to guess the transport or port.
+ENDPOINT_FILE = SUPPORT / "engine.json"
+DEFAULT_HOST = os.environ.get("VOICETYPE_HOST", "127.0.0.1")
+DEFAULT_PORT = int(os.environ.get("VOICETYPE_PORT", "8765"))
 
-
-def _local_model_ready() -> bool:
-    # Guard against a half-finished download sitting in the folder.
-    return LOCAL_WEIGHTS.exists() and LOCAL_WEIGHTS.stat().st_size > 100_000_000
-
-
-MODEL = os.environ.get(
-    "VOICETYPE_MODEL",
-    str(DEFAULT_MODEL_DIR) if _local_model_ready() else "mlx-community/whisper-large-v3-turbo",
-)
+# Picked once at startup; see backends.choose_backend().
+BACKEND: Backend = choose_backend()
 # Biasing the decoder toward Simplified Chinese stops whisper drifting into
 # Traditional characters, which it otherwise does on Mandarin audio.
 INITIAL_PROMPT = os.environ.get(
@@ -111,18 +114,13 @@ def load_model() -> None:
     with _model_lock:
         if _model_loaded:
             return
-        _pick_hf_endpoint()
-        import mlx_whisper  # noqa: F401  (import cost is part of warm-up)
-        log(f"loading {MODEL}")
+        log(f"loading {BACKEND.describe()}")
         started = time.time()
-        # Running a scrap of silence forces Metal kernels to compile now rather
-        # than on the user's first real utterance.
-        mlx_whisper.transcribe(
-            str(_write_silence()), path_or_hf_repo=MODEL, language="zh",
-            initial_prompt=INITIAL_PROMPT, verbose=None,
-        )
+        # Running a scrap of silence pays the one-off cost (Metal kernel
+        # compile / graph warm-up) now instead of on the first real utterance.
+        BACKEND.load(_write_silence())
         _model_loaded = True
-        log(f"model warm in {time.time() - started:.1f}s")
+        log(f"model warm in {time.time() - started:.1f}s ({BACKEND.describe()})")
 
 
 def _write_silence(seconds: float = 1.0) -> Path:
@@ -155,7 +153,6 @@ def audio_stats(path: str) -> tuple[float, float]:
 
 def transcribe(path: str, language: str = "zh", polish: bool = True) -> dict:
     load_model()
-    import mlx_whisper
 
     duration, rms = audio_stats(path)
     if duration < 0.2 or rms < SILENCE_RMS:
@@ -163,19 +160,23 @@ def transcribe(path: str, language: str = "zh", polish: bool = True) -> dict:
                 "audioSeconds": round(duration, 2), "rms": round(rms, 5)}
 
     started = time.time()
-    result = mlx_whisper.transcribe(
+    result = BACKEND.transcribe(
         path,
-        path_or_hf_repo=MODEL,
-        language=None if language in ("auto", "", None) else language,
-        initial_prompt=build_prompt(language),
-        temperature=0.0,
-        condition_on_previous_text=False,
-        no_speech_threshold=0.6,
-        compression_ratio_threshold=2.4,
-        verbose=None,
+        None if language in ("auto", "", None) else language,
+        build_prompt(language),
     )
     elapsed = time.time() - started
     raw = (result.get("text") or "").strip()
+
+    # Parroting the decoder prompt back is a real failure, mostly at beam_size=1.
+    if is_prompt_echo(raw, build_prompt(language)):
+        log(f"dropped prompt echo: {raw[:40]!r}")
+        return {
+            "text": "", "raw": raw, "reason": "prompt-echo",
+            "elapsedMs": int(elapsed * 1000),
+            "audioSeconds": round(duration, 2),
+            "rms": round(rms, 5),
+        }
 
     # whisper recites stock subtitle credits when the clip is just room noise.
     if is_hallucination(raw, rms):
@@ -208,6 +209,7 @@ def transcribe(path: str, language: str = "zh", polish: bool = True) -> dict:
         "text": text,
         "raw": raw,
         "language": result.get("language"),
+        "backend": BACKEND.describe(),
         "elapsedMs": int(elapsed * 1000),
         "audioSeconds": round(duration, 2),
         "rms": round(rms, 5),
@@ -229,7 +231,8 @@ class Handler(socketserver.StreamRequestHandler):
         cmd = request.get("cmd")
         try:
             if cmd == "ping":
-                self._reply({"ok": True, "model": MODEL, "warm": _model_loaded})
+                self._reply({"ok": True, "model": BACKEND.describe(),
+                             "backend": BACKEND.name, "warm": _model_loaded})
             elif cmd == "transcribe":
                 payload = transcribe(
                     request["wav"],
@@ -249,32 +252,86 @@ class Handler(socketserver.StreamRequestHandler):
         self.wfile.flush()
 
 
-class Server(socketserver.ThreadingUnixStreamServer):
+class UnixServer(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
 
 
-def serve() -> None:
-    SUPPORT.mkdir(parents=True, exist_ok=True)
-    if SOCK.exists():
-        try:
-            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            probe.settimeout(1.0)
-            probe.connect(str(SOCK))
-            probe.close()
-            log(f"another engine already listening on {SOCK}, exiting")
-            return
-        except Exception:  # noqa: BLE001
-            SOCK.unlink(missing_ok=True)
+class TcpServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    # Without this, Windows can keep the listening port unusable for a while
+    # after a crash. The explicit probe in serve() is what actually prevents a
+    # double start, so allowing reuse here costs nothing.
+    allow_reuse_address = True
 
-    log(f"serving on {SOCK}")
+
+def write_endpoint(transport: str, host: str, port: int | None) -> None:
+    """Publish how to reach this engine so clients never have to guess the
+    transport or port."""
+    payload = {"transport": transport, "backend": BACKEND.name, "pid": os.getpid()}
+    if transport == "unix":
+        payload["socket"] = str(SOCK)
+    else:
+        payload["host"] = host
+        payload["port"] = port
+    ENDPOINT_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+
+
+def _already_running(transport: str, host: str, port: int | None) -> bool:
+    family = socket.AF_UNIX if transport == "unix" else socket.AF_INET
+    probe = socket.socket(family, socket.SOCK_STREAM)
+    probe.settimeout(1.0)
+    try:
+        probe.connect(str(SOCK) if transport == "unix" else (host, port))
+        return True
+    except Exception:  # noqa: BLE001
+        if transport == "unix":
+            SOCK.unlink(missing_ok=True)   # leftover from a crash
+        return False
+    finally:
+        probe.close()
+
+
+VOCAB_HEADER = """# 一行一个词。专有名词/人名/内部术语放这里，识别时会按拼音纠正同音误听。
+"""
+
+
+def ensure_support_files() -> None:
+    """Create our own directory and a starter vocabulary file. Doing this here
+    rather than only in the installer means a fresh machine (or a test dir)
+    still gets the homophone-correction behaviour instead of silently using an
+    empty word list."""
+    SUPPORT.mkdir(parents=True, exist_ok=True)
+    if not VOCAB_FILE.exists():
+        VOCAB_FILE.write_text(VOCAB_HEADER, encoding="utf-8")
+
+
+def serve(transport: str = "unix", host: str = DEFAULT_HOST,
+          port: int = DEFAULT_PORT) -> None:
+    ensure_support_files()
+    if _already_running(transport, host, port):
+        log(f"another engine already listening ({transport}), exiting")
+        return
+
+    if transport == "unix":
+        server = UnixServer(str(SOCK), Handler)
+        where = f"unix:{SOCK}"
+    else:
+        server = TcpServer((host, port), Handler)
+        where = f"tcp:{host}:{port}"
+
+    # Only publish the endpoint once the socket is actually bound.
+    write_endpoint(transport, host, None if transport == "unix" else port)
+    log(f"serving on {where} · {BACKEND.describe()}")
     load_model()
-    server = Server(str(SOCK), Handler)
     try:
         server.serve_forever()
     finally:
         server.server_close()
-        SOCK.unlink(missing_ok=True)
+        if transport == "unix":
+            SOCK.unlink(missing_ok=True)
+        ENDPOINT_FILE.unlink(missing_ok=True)
 
 
 def main() -> None:
@@ -282,9 +339,32 @@ def main() -> None:
     if args and args[0] == "--once":
         target = args[1]
         language = args[2] if len(args) > 2 else "zh"
-        print(json.dumps(transcribe(target, language), ensure_ascii=False, indent=2))
+        payload = transcribe(target, language)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
-    serve()
+
+    # Windows has no unix sockets, so it defaults to loopback TCP.
+    transport = os.environ.get("VOICETYPE_TRANSPORT") or (
+        "tcp" if sys.platform == "win32" else "unix")
+    host, port = DEFAULT_HOST, DEFAULT_PORT
+    rest = list(args)
+    while rest:
+        flag = rest.pop(0)
+        if flag == "--serve":
+            continue
+        if flag == "--transport" and rest:
+            transport = rest.pop(0)
+        elif flag == "--host" and rest:
+            host = rest.pop(0)
+        elif flag == "--port" and rest:
+            port = int(rest.pop(0))
+        else:
+            print(f"unknown argument: {flag}", file=sys.stderr)
+            raise SystemExit(2)
+    if transport not in ("unix", "tcp"):
+        print(f"unknown transport: {transport}", file=sys.stderr)
+        raise SystemExit(2)
+    serve(transport, host, port)
 
 
 if __name__ == "__main__":

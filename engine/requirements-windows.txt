@@ -1,0 +1,14 @@
+# Windows 上跑引擎需要的依赖。macOS 走 MLX（见 install.sh），不装这些。
+#
+# 生成的依据：2026-11-15 在本机实测跑通 faster-whisper 后端后冻结的版本。
+# 两个坑：
+#   1. faster-whisper 声明 av>=11 但没有上限，而 av 19 移除了 metadata_errors 参数，
+#      装上 av 19 会直接崩（TypeError: open() got an unexpected keyword argument）。
+#      所以 av 必须钉住。
+#   2. ctranslate2 决定 CUDA 支持：有 NVIDIA 显卡时装默认版即可；
+#      纯 CPU 机器装 ctranslate2 的 CPU 版能省下几百 MB。
+faster-whisper==1.2.1
+ctranslate2>=4.9,<5
+av==14.1.0
+opencc-python-reimplemented==0.1.7
+pypinyin==0.55.0

@@ -197,6 +197,21 @@ def is_hallucination(text: str, rms: float | None = None) -> bool:
     return False
 
 
+def is_prompt_echo(text: str, prompt: str | None) -> bool:
+    """whisper sometimes answers with the prompt itself instead of transcribing —
+    mostly with greedy decoding (beam_size=1, which is the tempting setting when
+    you are trying to save CPU). The failure is embarrassing out loud: we would
+    paste our own decoder instructions into the user's document.
+
+    Needs >= 4 normalized characters so that a legitimate one-word utterance
+    cannot collide with a word in the prompt."""
+    a = normalize_for_match(text)
+    b = normalize_for_match(prompt or "")
+    if len(a) < 4 or not b:
+        return False
+    return a in b or (len(a) >= 8 and b in a)
+
+
 def clean(text: str, simplify: bool = True) -> str:
     """Return the polished transcript."""
     if not text or not text.strip():
@@ -244,6 +259,12 @@ if __name__ == "__main__":
                  ("谢谢观看", 0.0037),
                  ("我今天下午三点开会，记得请大家点赞订阅转发。", 0.0037)]:
         print(f"  [{'丢' if is_hallucination(c, r) else '留'}] rms={r:.4f}  {c}")
+
+    print("\n提示词复读判定:")
+    P = "以下是普通话的句子，请使用简体中文和正确的标点符号。"
+    for c in ["请使用简体中文和正确的标点符号。", "以下是普通话的句子", "我今天下午三点开会",
+              "好的", "esc"]:
+        print(f"  [{'丢' if is_prompt_echo(c, P) else '留'}] {c!r}")
 
     print("\n空转写判定:")
     for c in ["……", "。", "  ", "嗯", "好，我删了。"]:

@@ -106,10 +106,19 @@ python engine.py --once file.wav zh           # 单文件跑一次，方便排�
 
 ### 识别后端
 
-| 后端 | 用在哪 | 实测（7 秒中文音频） |
-|---|---|---|
-| `mlx` | Apple Silicon（默认） | large-v3-turbo，1.37s → RTF 0.19 |
-| `faster-whisper` | Windows / Linux / Intel Mac | small int8 CPU，2.12s → RTF 0.30 |
+| 后端 | 用在哪 | 模型 | 推理耗时 | RTF |
+|---|---|---|---|---|
+| `mlx` | Apple Silicon（默认） | large-v3-turbo | 1.37s | **0.19** |
+| `faster-whisper` | Windows / Linux / Intel Mac | small int8 · CPU | 2.12s | **0.30** |
+| `faster-whisper` | 同上 | medium int8 · CPU | 5.87s | 0.83 |
+| `faster-whisper` | 同上 | large-v3-turbo int8 · CPU | 7.72s | 1.09 |
+
+（7 秒中文音频，Apple M4。RTF < 1 = 比实时快。）
+
+**这张表决定了 Windows 该配什么机器**：CPU 上 **只有 `small` 能用**（约 3 倍实时）；
+`medium` 已经接近实时（RTF 0.83），`large-v3-turbo` **比实时还慢**（1.09）—— 听写时你会等它
+一个字一个字往外挤。而 M4 的单核性能比大多数 Windows 笔记本强，所以真实机器上还要再打折。
+**结论：Windows 上没 NVIDIA 独显就用 `small`；想要大模型的准确率，必须上 GPU。**
 
 切后端：`VOICETYPE_BACKEND=faster-whisper`；没有 GPU 时默认 `small` + int8，
 有 NVIDIA 卡时自动切 `large-v3-turbo` + float16。**别为了省 CPU 把 beam 调到 1**：

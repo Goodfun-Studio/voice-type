@@ -150,6 +150,47 @@ def apply_vocabulary(text: str, terms: list[str]) -> str:
     return text
 
 
+# whisper 在静音/底噪上会背出训练数据里的字幕落款。这些句子足够独特，
+# 只有"整段输出就是它"才丢，正常内容一律不碰。
+HALLUCINATION_CONTAINS = (
+    "请不吝点赞订阅转发打赏支持明镜与点点栏目",
+    "请不吝点赞订阅转发打赏支持",
+    "明镜与点点栏目",
+    "字幕由amaraorg社区提供",
+    "字幕志愿者提供",
+    "thanksforwatching",
+    "subscribetomychannel",
+    "likeandsubscribe",
+    "ご視聴ありがとうございました",
+)
+HALLUCINATION_EXACT = ("字幕志愿者", "感谢观看", "感谢您的观看", "谢谢观看", "请订阅")
+
+
+def normalize_for_match(text: str) -> str:
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff\u3040-\u30ff]", "", text.lower())
+
+
+# 短落款（4-5 字）本身也可能是人真说的话，所以只在录音安静时才判为幻觉。
+# 实测：幻觉那次的音频 rms 是 0.0037，正常说话 0.0063~0.13。
+QUIET_RMS = 0.012
+
+
+def is_hallucination(text: str, rms: float | None = None) -> bool:
+    """True when the transcript is a known whisper stock phrase.
+
+    Long phrases are unambiguous, so they go regardless of level. Short ones
+    only count when the recording was quiet, which is the condition that makes
+    whisper start reciting its training data."""
+    norm = normalize_for_match(text)
+    if not norm:
+        return False
+    if any(phrase in norm for phrase in HALLUCINATION_CONTAINS):
+        return True
+    if norm in HALLUCINATION_EXACT:
+        return rms is not None and rms < QUIET_RMS
+    return False
+
+
 def clean(text: str, simplify: bool = True) -> str:
     """Return the polished transcript."""
     if not text or not text.strip():
@@ -188,6 +229,16 @@ if __name__ == "__main__":
     for c in cases:
         print(f"  {c}\n→ {clean(c)}\n")
 
-    print("词表纠正:")
+    print("幻觉过滤:")
+    for c, r in [("请不吝点赞订阅转发打赏支持明镜与点点栏目", 0.0037),
+                 ("请不吝点赞 订阅 转发 打赏支持明镜与点点栏目", 0.0037),
+                 ("Thanks for watching!", 0.0037),
+                 ("感谢观看", 0.0037),
+                 ("感谢观看", 0.0500),
+                 ("谢谢观看", 0.0037),
+                 ("我今天下午三点开会，记得请大家点赞订阅转发。", 0.0037)]:
+        print(f"  [{'丢' if is_hallucination(c, r) else '留'}] rms={r:.4f}  {c}")
+
+    print("\n词表纠正:")
     for c in ["然后我们把食鱼那个流程再对一遍", "把照片扣图以后放进鱼刚里", "今天晚饭吃鱼"]:
         print(f"  {c}\n→ {apply_vocabulary(c, ['识鱼', '鱼缸', '抠图'])}\n")

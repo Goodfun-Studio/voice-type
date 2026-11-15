@@ -23,7 +23,7 @@ import wave
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from cleanup import apply_vocabulary, clean  # noqa: E402
+from cleanup import apply_vocabulary, clean, is_hallucination  # noqa: E402
 
 def _pick_hf_endpoint() -> None:
     """huggingface.co is unreachable on some networks (and hard-blocked on
@@ -176,6 +176,17 @@ def transcribe(path: str, language: str = "zh", polish: bool = True) -> dict:
     )
     elapsed = time.time() - started
     raw = (result.get("text") or "").strip()
+
+    # whisper recites stock subtitle credits when the clip is just room noise.
+    if is_hallucination(raw, rms):
+        log(f"dropped hallucination on quiet audio (rms={rms:.5f}): {raw[:40]}")
+        return {
+            "text": "", "raw": raw, "reason": "hallucination",
+            "elapsedMs": int(elapsed * 1000),
+            "audioSeconds": round(duration, 2),
+            "rms": round(rms, 5),
+        }
+
     text = clean(raw) if polish else raw
     if polish:
         text = apply_vocabulary(text, vocabulary())
@@ -189,6 +200,7 @@ def transcribe(path: str, language: str = "zh", polish: bool = True) -> dict:
         "language": result.get("language"),
         "elapsedMs": int(elapsed * 1000),
         "audioSeconds": round(duration, 2),
+        "rms": round(rms, 5),
         "rtf": round(elapsed / duration, 3) if duration else None,
     }
 

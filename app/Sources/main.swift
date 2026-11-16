@@ -39,11 +39,15 @@ struct Config: Codable {
     var socket: String
     var language: String   // "zh" | "en" | "auto"
     var sound: Bool
+    /// nil means "never configured" — which is what triggers the first-run
+    /// settings window.
+    var trigger: Trigger?
 
     static func load() -> Config {
         if let d = try? Data(contentsOf: Paths.config),
            let c = try? JSONDecoder().decode(Config.self, from: d) { return c }
-        return Config(python: "", engine: "", socket: Paths.socket, language: "zh", sound: true)
+        return Config(python: "", engine: "", socket: Paths.socket,
+                      language: "zh", sound: true, trigger: nil)
     }
 
     func save() {
@@ -58,8 +62,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     enum State { case idle, recording, transcribing }
 
     private var statusItem: NSStatusItem!
-    private let hotkey = FnHotkey()
-    private let altHotkey = CarbonHotKey()
+    private let trigger = TriggerController()
+    private let settings = SettingsWindowController()
     private let recorder = Recorder()
     private let hud = HUD()
     private var engine: EngineClient!
@@ -87,21 +91,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async { self?.hud.pushLevel(level) }
         }
 
-        hotkey.onDoubleTap = { [weak self] in
-            DispatchQueue.main.async { self?.toggle() }
-        }
-        altHotkey.register(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey))
-        altHotkey.onFire = { [weak self] in
-            DispatchQueue.main.async { self?.toggle() }
-        }
         // Only live while a recording is in flight — see beginRecordingWindow().
         cancelHotkey.onFire = { [weak self] in
             DispatchQueue.main.async { self?.cancel() }
         }
-        hotkey.start()
+        trigger.onFire = { [weak self] in
+            DispatchQueue.main.async { self?.toggle() }
+        }
+        // Start on the configured trigger (or the default) right away, so the
+        // tool works even if the user closes the onboarding window.
+        trigger.apply(config.trigger ?? .fallback)
 
         buildMenu()
         requestPermissionsIfNeeded()
+
+        if config.trigger == nil {
+            // Never configured: walk the user through picking a trigger rather
+            // than silently assuming double-Fn.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+                self?.presentSettings(firstRun: true)
+            }
+        }
         refreshStatus()
 
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -149,9 +159,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         header.isEnabled = false
         menu.addItem(header)
 
-        let hint = NSMenuItem(title: "双击 Fn 开始 / 结束（备选 ⌥空格）", action: nil, keyEquivalent: "")
+        let current = config.trigger ?? .fallback
+        let hint = NSMenuItem(title: "触发方式：\(current.label)", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
+        addItem(menu, "设置触发方式…", #selector(openSettings))
         menu.addItem(.separator())
 
         let langMenu = NSMenu()
@@ -390,6 +402,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buildMenu()
     }
 
+    @objc private func openSettings() { presentSettings(firstRun: false) }
+
+    private func presentSettings(firstRun: Bool) {
+        guard !settings.isVisible else { return }
+        // Suspend the live trigger while the window is open, otherwise testing a
+        // shortcut would start a real recording behind the settings window.
+        trigger.stop()
+        settings.onClose = { [weak self] in
+            guard let self else { return }
+            self.trigger.apply(self.config.trigger ?? .fallback)
+            self.buildMenu()
+        }
+        settings.show(firstRun: firstRun, current: config.trigger ?? .fallback) { [weak self] chosen in
+            guard let self else { return }
+            self.config.trigger = chosen
+            self.config.save()
+            self.trigger.apply(chosen)
+            self.buildMenu()
+            self.hud.toast("触发方式已设为「\(chosen.label)」")
+            logLine("trigger set to \(chosen.label) (kind=\(chosen.kind.rawValue) keyCode=\(chosen.keyCode) taps=\(chosen.taps))")
+        }
+    }
+
     @objc private func cancelCurrent() { cancel() }
 
     @objc private func grantAccessibility() { openAccessibilityPane() }
@@ -450,6 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ note: Notification) {
         endRecordingWindow()
+        trigger.stop()
         engine?.shutdown()
     }
 }

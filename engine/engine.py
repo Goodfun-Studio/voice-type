@@ -248,8 +248,14 @@ class Handler(socketserver.StreamRequestHandler):
             self._reply({"error": str(exc)})
 
     def _reply(self, payload: dict) -> None:
-        self.wfile.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-        self.wfile.flush()
+        # The client may have gone away mid-request (a probe that times out, the
+        # app restarting). A dead pipe is not an engine error, so don't spray
+        # tracebacks into the log over it.
+        try:
+            self.wfile.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
 
 class UnixServer(socketserver.ThreadingUnixStreamServer):

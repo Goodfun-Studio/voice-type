@@ -490,7 +490,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             logLine(now ? "accessibility permission GRANTED — pasting directly now"
                         : "accessibility permission REMOVED")
             // Losing or gaining the permission changes what the Fn trigger can do.
-            self.trigger.apply(self.config.trigger ?? .fallback, trusted: now)
+            self.trigger.apply(self.config.trigger ?? .fallback)
             self.refreshStatus()
             self.buildMenu()
             self.hud.toast(now ? "辅助功能已就绪，现在能直接输入了" : "辅助功能权限被关掉了")

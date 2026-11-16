@@ -7,6 +7,8 @@ APP="$PWD/../bin/VoiceType.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp Info.plist "$APP/Contents/Info.plist"
+[ -f icon/AppIcon.icns ] || ./icon/make-icns.sh
+cp icon/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 swiftc -O -whole-module-optimization \
   -target arm64-apple-macos13.0 \

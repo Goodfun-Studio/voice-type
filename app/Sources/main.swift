@@ -104,7 +104,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.presentSettings(firstRun: false)
         }
 
-        NSApp.setActivationPolicy(.accessory)
+        // A real Dock icon: it is the one entry point that is always findable,
+        // and clicking it reopens the settings window (see
+        // applicationShouldHandleReopen). A pure menu-bar agent was too easy to
+        // lose — the icon can be pushed off the menu bar entirely.
+        NSApp.setActivationPolicy(.regular)
         engine = EngineClient(config: config)
         hud.prepare()
 
@@ -447,7 +451,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.trigger.apply(self.config.trigger ?? .fallback)
             self.buildMenu()
-            NSApp.setActivationPolicy(.accessory)
         }
         settings.show(firstRun: firstRun, current: config.trigger ?? .fallback) { [weak self] chosen in
             guard let self else { return }

@@ -15,3 +15,7 @@ __pycache__/
 *.p12
 config.json
 vocabulary.txt
+
+# 图标：只留源图，.icns 由 app/icon/make-icns.sh 生成
+app/icon/AppIcon.icns
+app/icon/AppIcon.iconset/

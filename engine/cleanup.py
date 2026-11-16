@@ -212,6 +212,34 @@ def is_prompt_echo(text: str, prompt: str | None) -> bool:
     return a in b or (len(a) >= 8 and b in a)
 
 
+def is_repetition_loop(text: str, min_repeats: int = 5) -> bool:
+    """whisper can lock into a repeat loop on a hard clip. It normally escapes by
+    retrying at a higher temperature when the compression ratio looks bad, but we
+    pin temperature=0.0 for determinism, so there is no fallback — the loop comes
+    out verbatim ("词：词：词：词：…"). Detect it rather than paste it.
+
+    Laughter is exempt: "哈哈哈哈哈哈" is a real thing to say."""
+    norm = normalize_for_match(text)
+    if len(norm) < 8:
+        return False
+    for size in (1, 2, 3, 4):
+        i = 0
+        while i + size <= len(norm):
+            unit = norm[i:i + size]
+            if all(ch in KEEP_REPEATS for ch in unit):
+                i += 1
+                continue
+            run = 1
+            j = i + size
+            while j + size <= len(norm) and norm[j:j + size] == unit:
+                run += 1
+                j += size
+            if run >= min_repeats:
+                return True
+            i = j if run > 1 else i + 1
+    return False
+
+
 def clean(text: str, simplify: bool = True) -> str:
     """Return the polished transcript."""
     if not text or not text.strip():
@@ -265,6 +293,11 @@ if __name__ == "__main__":
     for c in ["请使用简体中文和正确的标点符号。", "以下是普通话的句子", "我今天下午三点开会",
               "好的", "esc"]:
         print(f"  [{'丢' if is_prompt_echo(c, P) else '留'}] {c!r}")
+
+    print("\n复读死循环判定:")
+    for c in ["词：词：词：词：词：词：词：词：词：词：", "哈哈哈哈哈哈", "我今天下午三点跟产品开个会",
+              "那个那个那个那个那个", "好好好好好好", "谢谢大家"]:
+        print(f"  [{'丢' if is_repetition_loop(c) else '留'}] {c[:26]}")
 
     print("\n空转写判定:")
     for c in ["……", "。", "  ", "嗯", "好，我删了。"]:

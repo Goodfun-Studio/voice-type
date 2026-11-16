@@ -34,7 +34,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backends import Backend, choose_backend, ensure_hf_endpoint  # noqa: E402
 from cleanup import (apply_vocabulary, clean, has_speech,  # noqa: E402
-                      is_hallucination, is_prompt_echo)
+                      is_hallucination, is_prompt_echo, is_repetition_loop)
 
 # A launchd-launched app inherits a bare PATH, so mlx_whisper's ffmpeg shell-out
 # would fail there even though ffmpeg is installed. Make the usual bin dirs visible.
@@ -167,6 +167,16 @@ def transcribe(path: str, language: str = "zh", polish: bool = True) -> dict:
     )
     elapsed = time.time() - started
     raw = (result.get("text") or "").strip()
+
+    # A repeat loop is a failed decode, not something to paste.
+    if is_repetition_loop(raw):
+        log(f"dropped repetition loop: {raw[:40]!r}…")
+        return {
+            "text": "", "raw": raw, "reason": "repetition",
+            "elapsedMs": int(elapsed * 1000),
+            "audioSeconds": round(duration, 2),
+            "rms": round(rms, 5),
+        }
 
     # Parroting the decoder prompt back is a real failure, mostly at beam_size=1.
     if is_prompt_echo(raw, build_prompt(language)):

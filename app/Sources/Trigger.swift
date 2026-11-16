@@ -239,6 +239,12 @@ final class TriggerController {
         logLine("trigger applied: \(trigger.label) [\(trigger.kind.rawValue) keyCode=\(trigger.keyCode) taps=\(trigger.taps)]")
         switch trigger.kind {
         case .modifierTap:
+            // Note: an event tap that consumes Fn was implemented and measured
+            // (2026-11-16): the tap did receive Fn and did start recordings, but
+            // macOS still opened the emoji picker at the same millisecond. The
+            // globe action happens below the CGEvent layer, so consuming the
+            // event cannot stop it — while it *does* break Fn+arrow shortcuts.
+            // Not worth the trade, so Fn stays on passive monitoring.
             let watcher = ModifierTapWatcher(keyCode: trigger.keyCode, taps: trigger.taps)
             watcher.onTrigger = { [weak self] in self?.onFire?() }
             watcher.start()

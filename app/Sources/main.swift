@@ -82,7 +82,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancelledGeneration = -1
     private var trustTimer: Timer?
 
+    private static let openSettingsNotification = Notification.Name("com.goodfunstudio.voicetype.openSettings")
+
     func applicationDidFinishLaunching(_ note: Notification) {
+        // Two instances would both grab the trigger and both react to it.
+        // So a second launch just asks the first one to show settings and exits.
+        let bundleID = Bundle.main.bundleIdentifier ?? ""
+        let others = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+        if let existing = others.first {
+            logLine("second instance asked to open settings (existing pid \(existing.processIdentifier))")
+            DistributedNotificationCenter.default().postNotificationName(
+                Self.openSettingsNotification, object: nil, userInfo: nil, deliverImmediately: true)
+            existing.activate()
+            Thread.sleep(forTimeInterval: 0.4)
+            NSApp.terminate(nil)
+            return
+        }
+        DistributedNotificationCenter.default().addObserver(
+            forName: Self.openSettingsNotification, object: nil, queue: .main) { [weak self] _ in
+                self?.presentSettings(firstRun: false)
+        }
+
         NSApp.setActivationPolicy(.accessory)
         engine = EngineClient(config: config)
         hud.prepare()
@@ -199,6 +220,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshStatus() {
+        guard let button = statusItem.button else { return }
         let symbol: String
         if !trusted {
             // Without Accessibility we can neither read Fn nor paste, so say so
@@ -211,7 +233,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .transcribing: symbol = "ellipsis.circle"
             }
         }
-        statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Voice Type")
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Voice Type") {
+            button.image = image
+            button.title = ""
+        } else {
+            // A status item whose image fails to resolve has zero width and is
+            // simply invisible — which is how you end up with a tool that has no
+            // way in. Never leave it blank.
+            button.image = nil
+            button.title = "🎙"
+        }
     }
 
     // MARK: flow
@@ -406,6 +437,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func presentSettings(firstRun: Bool) {
         guard !settings.isVisible else { return }
+        // While a real window is up, behave like a normal app: a Dock icon means
+        // the window can be found (and Cmd-Tab'd to) instead of being lost.
+        NSApp.setActivationPolicy(.regular)
         // Suspend the live trigger while the window is open, otherwise testing a
         // shortcut would start a real recording behind the settings window.
         trigger.stop()
@@ -413,6 +447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.trigger.apply(self.config.trigger ?? .fallback)
             self.buildMenu()
+            NSApp.setActivationPolicy(.accessory)
         }
         settings.show(firstRun: firstRun, current: config.trigger ?? .fallback) { [weak self] chosen in
             guard let self else { return }
@@ -431,10 +466,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func grantAccessibility() { openAccessibilityPane() }
 
     @objc private func openAccessibilityPane() {
+        // The system prompt only appears for an app that is allowed to come
+        // forward. As a background agent we are not frontmost, so without this
+        // the prompt is silently swallowed and the user sees nothing.
+        NSApp.activate(ignoringOtherApps: true)
         // Asking also registers the app in the list, so the switch is right there.
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(opts)
-        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+        // The legacy "com.apple.preference.security" id lands on the General pane
+        // on current macOS; the PrivacySecurity extension id opens the real page.
+        if let url = URL(string:
+            "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_Accessibility") {
             NSWorkspace.shared.open(url)
         }
     }
@@ -445,6 +487,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let now = AXIsProcessTrusted()
             guard now != self.trusted else { return }
             self.trusted = now
+            logLine(now ? "accessibility permission GRANTED — pasting directly now"
+                        : "accessibility permission REMOVED")
+            // Losing or gaining the permission changes what the Fn trigger can do.
+            self.trigger.apply(self.config.trigger ?? .fallback, trusted: now)
             self.refreshStatus()
             self.buildMenu()
             self.hud.toast(now ? "辅助功能已就绪，现在能直接输入了" : "辅助功能权限被关掉了")
@@ -483,6 +529,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openLog() { NSWorkspace.shared.open(Paths.log) }
     @objc private func openHistory() { NSWorkspace.shared.open(Paths.history) }
     @objc private func quit() { NSApp.terminate(nil) }
+
+    /// Reached when the bundle is opened again from Finder / Dock.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        presentSettings(firstRun: false)
+        return true
+    }
 
     func applicationWillTerminate(_ note: Notification) {
         endRecordingWindow()

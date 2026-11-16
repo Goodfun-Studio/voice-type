@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 
 /// The settings / onboarding window: pick how Voice Type is triggered.
 ///
@@ -25,6 +26,10 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var saveButton: NSButton!
     private var cancelButton: NSButton!
 
+    private var fnNoticeRow: NSStackView!
+    private var fnNoticeLabel: NSTextField!
+    private var fnFixButton: NSButton!
+    private var contentStack: NSStackView!
     private var testController: TriggerController?
     private var recorder: ShortcutRecorder?
     private var fireCount = 0
@@ -74,6 +79,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         root.spacing = 14
         root.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 20, right: 22)
         root.translatesAutoresizingMaskIntoConstraints = false
+        contentStack = root
         panel.contentView = NSView()
         panel.contentView?.addSubview(root)
         NSLayoutConstraint.activate([
@@ -90,6 +96,25 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         lead.textColor = .secondaryLabelColor
         lead.preferredMaxLayoutWidth = 420
         root.addArrangedSubview(lead)
+
+        // Only relevant when an Fn-family trigger is selected: macOS owns the
+        // globe key and will pop the emoji picker alongside our recording.
+        let notice = NSTextField(wrappingLabelWithString:
+            "macOS 默认把 Fn 键绑成「显示表情与符号」，所以按 Fn 时会连表情面板一起弹出来。"
+            + "关掉这个行为即可 —— 注意这类键盘映射在登录时才读取，改完要注销重登一次。")
+        notice.font = .systemFont(ofSize: 11)
+        notice.textColor = .secondaryLabelColor
+        notice.preferredMaxLayoutWidth = 380
+        fnFixButton = NSButton(title: "帮我关掉", target: self, action: #selector(disableFnEmojiPanel))
+        fnFixButton.bezelStyle = .rounded
+        fnFixButton.controlSize = .small
+        let noticeRow = NSStackView(views: [notice, fnFixButton])
+        noticeRow.orientation = .horizontal
+        noticeRow.alignment = .top
+        noticeRow.spacing = 10
+        fnNoticeRow = noticeRow
+        fnNoticeLabel = notice
+        root.addArrangedSubview(noticeRow)
 
         root.addArrangedSubview(sectionLabel("触发方式"))
 
@@ -202,6 +227,51 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         customLabel.stringValue = customTrigger?.label ?? "尚未录制"
         customLabel.textColor = customTrigger == nil ? .tertiaryLabelColor : .secondaryLabelColor
         saveButton.isEnabled = currentTrigger != nil
+        updateFnNotice()
+        resizeToFit()
+    }
+
+    /// The Fn notice only means something for Fn-family triggers.
+    private func updateFnNotice() {
+        let trigger = currentTrigger
+        let usesFn = trigger?.kind == .modifierTap && trigger?.keyCode == kVK_Function
+        fnNoticeRow.isHidden = !usesFn
+    }
+
+    /// Let the content decide the window height instead of guessing a number —
+    /// otherwise toggling the notice row clips whatever is below it.
+    private func resizeToFit() {
+        guard let panel = window, let stack = contentStack else { return }
+        stack.layoutSubtreeIfNeeded()
+        let fitted = stack.fittingSize
+        let current = panel.contentRect(forFrameRect: panel.frame).size
+        guard abs(current.height - fitted.height) > 0.5 else { return }
+        var frame = panel.frame
+        let chrome = frame.height - current.height
+        frame.origin.y -= (fitted.height - current.height)
+        frame.size.height = fitted.height + chrome
+        panel.setFrame(frame, display: true, animate: false)
+    }
+
+    @objc private func disableFnEmojiPanel() {
+        // Explicit user action, never silent: this is a system-wide setting.
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/defaults")
+        task.arguments = ["write", "-g", "AppleFnUsageType", "-int", "0"]
+        do {
+            try task.run()
+            task.waitUntilExit()
+            logLine("AppleFnUsageType set to 0 by user request (exit \(task.terminationStatus))")
+            fnNoticeLabel.stringValue = "已写入（AppleFnUsageType = 0）。注销重登后，按 Fn 就只会触发录音，"
+                + "不再弹表情面板了。（表情面板用 ⌃⌘空格 照样能开。）"
+            fnNoticeLabel.textColor = .systemGreen
+            fnFixButton.isEnabled = false
+        } catch {
+            fnNoticeLabel.stringValue = "写入失败：\(error.localizedDescription)。"
+                + "可以手动改：系统设置 → 键盘 →「按下 🌐 键时」"
+            fnNoticeLabel.textColor = .systemOrange
+        }
+        resizeToFit()
     }
 
     @objc private func radioChanged(_ sender: NSButton) {

@@ -28,6 +28,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var testController: TriggerController?
     private var recorder: ShortcutRecorder?
     private var fireCount = 0
+    /// AppKit also sends a radio button's action when we set its state in code.
+    /// Without this gate our own refresh looks exactly like a user click, and
+    /// the selection silently walks down the list.
+    private var isProgrammaticUpdate = false
+    private var isFinishing = false
 
     var isVisible: Bool { window != nil }
 
@@ -43,6 +48,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             selectedIndex = presets.count
             customTrigger = current
         }
+        isFinishing = false
         buildWindow()
         refreshSelectionUI()
         startTestListener()
@@ -149,11 +155,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         cancelButton = NSButton(title: isFirstRun ? "用默认（连按两次 Fn）" : "取消",
                                 target: self, action: #selector(cancelTapped))
         cancelButton.bezelStyle = .rounded
-        cancelButton.keyEquivalent = "\u{1b}"
         saveButton = NSButton(title: isFirstRun ? "开始使用" : "保存",
                               target: self, action: #selector(saveTapped))
         saveButton.bezelStyle = .rounded
-        saveButton.keyEquivalent = "\r"
         buttons.addArrangedSubview(cancelButton)
         buttons.addArrangedSubview(saveButton)
         let spacer = NSView()
@@ -189,6 +193,8 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func refreshSelectionUI() {
+        isProgrammaticUpdate = true
+        defer { isProgrammaticUpdate = false }
         for (index, button) in radios.enumerated() {
             button.state = index == selectedIndex ? .on : .off
         }
@@ -199,6 +205,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     @objc private func radioChanged(_ sender: NSButton) {
+        guard !isProgrammaticUpdate else { return }
         selectedIndex = sender.tag
         refreshSelectionUI()
         startTestListener()
@@ -283,19 +290,36 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     private func finish(with trigger: Trigger?) {
+        guard !isFinishing else { return }
+        isFinishing = true
         stopEverything()
+        // Detach before hiding: a button that outlives its window can still fire
+        // its action, and would then write a trigger the user never chose.
+        for button in radios { button.target = nil; button.action = nil }
+        customRadio?.target = nil
+        customRadio?.action = nil
+        recordButton?.target = nil
+        recordButton?.action = nil
         let handler = onSave
-        let close = onClose
         window?.orderOut(nil)
         window = nil
+        onClose = nil            // closing must not re-apply behind a save
         if let trigger { handler?(trigger) }
-        close?()
+        isFinishing = false
     }
 
     func windowWillClose(_ notification: Notification) {
+        guard !isFinishing else { return }
+        isFinishing = true
         stopEverything()
+        for button in radios { button.target = nil; button.action = nil }
+        customRadio?.target = nil
+        customRadio?.action = nil
         window = nil
-        onClose?()
+        let close = onClose
+        onClose = nil
+        close?()
+        isFinishing = false
     }
 
     private func stopEverything() {

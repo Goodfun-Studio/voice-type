@@ -416,6 +416,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         settings.show(firstRun: firstRun, current: config.trigger ?? .fallback) { [weak self] chosen in
             guard let self else { return }
+            logLine("settings onSave fired with \(chosen.label)")
             self.config.trigger = chosen
             self.config.save()
             self.trigger.apply(chosen)

@@ -54,8 +54,9 @@ def find_data_offset(path: Path) -> int:
 class StreamSession:
     def __init__(self, wav_path: str, language: str = "zh",
                  transcribe=None, lock: threading.Lock | None = None,
-                 context_carry: bool = True) -> None:
+                 context_carry: bool = True, junk_filter=None) -> None:
         self.context_carry = context_carry
+        self._junk_filter = junk_filter
         self.path = Path(wav_path)
         self.language = language
         self._transcribe = transcribe          # callable(wav_path, language) -> text
@@ -157,6 +158,10 @@ class StreamSession:
             return
         self.segment_seconds.append(seconds)
         text = self._run_model(segment)
+        # 逐段过滤：复读/幻觉/复读提示词都是解码失败，既不该进实时预览，
+        # 也不该进最终文本。判定逻辑由调用方给（引擎侧统一）。
+        if text and self._junk_filter and self._junk_filter(text, _rms(segment)):
+            return
         if text:
             self._segments.append(text)
             # Carrying a little of the previous text helps the model keep the

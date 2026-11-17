@@ -124,6 +124,43 @@ def load_model() -> None:
         log(f"model warm in {time.time() - started:.1f}s ({BACKEND.describe()})")
 
 
+def junk_reason(raw: str, rms: float | None = None, language: str = "zh") -> str | None:
+    """Why this transcript should be dropped — or None if it is fine.
+
+    This is the single definition of "junk" for the whole engine: the one-shot
+    path, the streaming merge, and the per-segment streaming filter all ask here.
+    """
+    if is_repetition_loop(raw):
+        return "repetition"
+    if is_prompt_echo(raw, build_prompt(language)):
+        return "prompt-echo"
+    if is_hallucination(raw, rms):
+        return "hallucination"
+    return None
+
+
+def gate_and_polish(raw: str, rms: float | None = None, polish: bool = True,
+                    language: str = "zh") -> tuple[str, str | None]:
+    """The one and only place a transcript passes through the safety gates.
+
+    Every gate lives here on purpose: when streaming was added, the repeat-loop
+    and prompt-echo guards were only wired into the one-shot path, so a repeat
+    loop got pasted straight into the user's document. Two code paths calling one
+    function cannot drift like that.
+
+    Returns (text, reason). A non-None reason means "drop this".
+    """
+    reason = junk_reason(raw, rms, language)
+    if reason:
+        return "", reason
+    text = clean(raw) if polish else raw
+    if polish:
+        text = apply_vocabulary(text, vocabulary())
+    if not has_speech(text):
+        return "", "no-words"
+    return text, None
+
+
 def _write_silence(seconds: float = 1.0) -> Path:
     path = SUPPORT / "warmup.wav"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -169,53 +206,15 @@ def transcribe(path: str, language: str = "zh", polish: bool = True) -> dict:
     elapsed = time.time() - started
     raw = (result.get("text") or "").strip()
 
-    # A repeat loop is a failed decode, not something to paste.
-    if is_repetition_loop(raw):
-        log(f"dropped repetition loop: {raw[:40]!r}…")
+    text, reason = gate_and_polish(raw, rms, polish, language)
+    if reason:
+        log(f"dropped transcript ({reason}): {raw[:40]!r}")
         return {
-            "text": "", "raw": raw, "reason": "repetition",
+            "text": "", "raw": raw, "reason": reason,
             "elapsedMs": int(elapsed * 1000),
             "audioSeconds": round(duration, 2),
             "rms": round(rms, 5),
         }
-
-    # Parroting the decoder prompt back is a real failure, mostly at beam_size=1.
-    if is_prompt_echo(raw, build_prompt(language)):
-        log(f"dropped prompt echo: {raw[:40]!r}")
-        return {
-            "text": "", "raw": raw, "reason": "prompt-echo",
-            "elapsedMs": int(elapsed * 1000),
-            "audioSeconds": round(duration, 2),
-            "rms": round(rms, 5),
-        }
-
-    # whisper recites stock subtitle credits when the clip is just room noise.
-    if is_hallucination(raw, rms):
-        log(f"dropped hallucination on quiet audio (rms={rms:.5f}): {raw[:40]}")
-        return {
-            "text": "", "raw": raw, "reason": "hallucination",
-            "elapsedMs": int(elapsed * 1000),
-            "audioSeconds": round(duration, 2),
-            "rms": round(rms, 5),
-        }
-
-    text = clean(raw) if polish else raw
-    if polish:
-        text = apply_vocabulary(text, vocabulary())
-
-    # A bare "……" is not something to paste into someone's document.
-    if not has_speech(text):
-        log(f"dropped wordless transcript (rms={rms:.5f}): {text[:20]!r}")
-        return {
-            "text": "", "raw": raw, "reason": "no-words",
-            "elapsedMs": int(elapsed * 1000),
-            "audioSeconds": round(duration, 2),
-            "rms": round(rms, 5),
-        }
-
-    # whisper sometimes only emits a subtitle-style credit on noise.
-    if text and len(text) < 30 and "字幕" in text and "提供" in text:
-        text = ""
     return {
         "text": text,
         "raw": raw,
@@ -247,7 +246,10 @@ def stream_start(wav: str, language: str = "zh") -> dict:
     with _stream_lock:
         if _stream is not None:
             _stream.finish(timeout=5)
-        session = StreamSession(wav, language, transcribe=_segment_transcribe, lock=_model_lock)
+        session = StreamSession(
+            wav, language, transcribe=_segment_transcribe, lock=_model_lock,
+            junk_filter=lambda text, rms: junk_reason(text, rms, language),
+        )
         session.start()
         _stream = session
     log(f"stream started on {wav}")
@@ -274,7 +276,7 @@ def stream_cancel() -> dict:
     return {"ok": True, "cancelled": True}
 
 
-def stream_finish(polish: bool = True) -> dict:
+def stream_finish(polish: bool = True, language: str = "zh") -> dict:
     """Stop tailing, transcribe the tail, then run the normal cleanup pipeline."""
     global _stream
     with _stream_lock:
@@ -290,17 +292,10 @@ def stream_finish(polish: bool = True) -> dict:
     # The per-segment text is raw; gates and cleanup work better on the whole.
     payload = {"raw": merged, "segments": result.get("segments", 0),
                "tailMs": int(elapsed * 1000), "backend": BACKEND.describe()}
-    if not merged.strip():
-        payload.update({"text": "", "reason": "silence"})
-        return payload
-    if is_hallucination(merged, None):
-        payload.update({"text": "", "reason": "hallucination"})
-        return payload
-    text = clean(merged) if polish else merged
-    if polish:
-        text = apply_vocabulary(text, vocabulary())
-    if not has_speech(text):
-        payload.update({"text": "", "reason": "no-words"})
+    text, reason = gate_and_polish(merged, None, polish, language)
+    if reason:
+        log(f"stream dropped ({reason}): {merged[:40]!r}")
+        payload.update({"text": "", "reason": reason})
         return payload
     payload["text"] = text
     log(f"stream finished: {result.get('segments')} segments, tail {int(elapsed*1000)}ms, {len(text)} chars")
@@ -330,7 +325,8 @@ class Handler(socketserver.StreamRequestHandler):
             elif cmd == "stream_cancel":
                 self._reply(stream_cancel())
             elif cmd == "stream_finish":
-                payload = stream_finish(request.get("polish", True))
+                payload = stream_finish(request.get("polish", True),
+                                        request.get("language", "zh"))
                 payload["ok"] = True
                 self._reply(payload)
             elif cmd == "transcribe":

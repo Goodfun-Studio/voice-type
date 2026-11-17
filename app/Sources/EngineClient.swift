@@ -67,6 +67,35 @@ final class EngineClient {
         (try? request(["cmd": "ping"], timeout: 1.2)) != nil
     }
 
+    // MARK: streaming
+
+    /// Ask the engine to start transcribing a file that is still being written.
+    /// Returns false when the engine does not support it, so the caller can fall
+    /// back to the one-shot path instead of losing the recording.
+    func streamStart(wav: String, language: String?) -> Bool {
+        do {
+            _ = try request(["cmd": "stream_start", "wav": wav, "language": language ?? "zh"],
+                            timeout: 120)
+            return true
+        } catch {
+            logLine("stream_start failed (\(error.localizedDescription)) — will transcribe in one shot")
+            return false
+        }
+    }
+
+    /// Non-blocking: only called while recording, so a slow answer must not stall us.
+    func streamState() -> [String: Any]? {
+        try? request(["cmd": "stream_state"], timeout: 2)
+    }
+
+    func streamFinish(language: String?) throws -> [String: Any] {
+        try request(["cmd": "stream_finish", "language": language ?? "zh"], timeout: 120)
+    }
+
+    func streamCancel() {
+        _ = try? request(["cmd": "stream_cancel"], timeout: 3)
+    }
+
     func transcribe(wav: String, language: String?) throws -> [String: Any] {
         try request(["cmd": "transcribe", "wav": wav, "language": language ?? "auto"],
                     timeout: 180)

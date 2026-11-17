@@ -33,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from backends import Backend, choose_backend, ensure_hf_endpoint  # noqa: E402
+from streaming import StreamSession  # noqa: E402
 from cleanup import (apply_vocabulary, clean, has_speech,  # noqa: E402
                       is_hallucination, is_prompt_echo, is_repetition_loop)
 
@@ -227,6 +228,85 @@ def transcribe(path: str, language: str = "zh", polish: bool = True) -> dict:
     }
 
 
+_stream: StreamSession | None = None
+_stream_lock = threading.Lock()
+
+
+def _segment_transcribe(wav_path: str, language: str, carry: str = "") -> str:
+    """Used by the streaming session. The session already holds the model lock."""
+    prompt = build_prompt(language)
+    if carry:
+        prompt = f"{carry}。{prompt}" if prompt else carry
+    result = BACKEND.transcribe(wav_path, None if language in ("auto", "", None) else language, prompt)
+    return (result.get("text") or "").strip()
+
+
+def stream_start(wav: str, language: str = "zh") -> dict:
+    global _stream
+    load_model()
+    with _stream_lock:
+        if _stream is not None:
+            _stream.finish(timeout=5)
+        session = StreamSession(wav, language, transcribe=_segment_transcribe, lock=_model_lock)
+        session.start()
+        _stream = session
+    log(f"stream started on {wav}")
+    return {"ok": True}
+
+
+def stream_state() -> dict:
+    with _stream_lock:
+        if _stream is None:
+            return {"partial": "", "segments": 0, "audioSeconds": 0.0}
+        return _stream.state()
+
+
+def stream_cancel() -> dict:
+    """Drop the session without transcribing the tail — Esc must stay free."""
+    global _stream
+    with _stream_lock:
+        session, _stream = _stream, None
+    if session is None:
+        return {"ok": True, "cancelled": False}
+    # Ask it to stop; the tail is deliberately left untranscribed.
+    session._stop.set()          # noqa: SLF001  (internal by design: cancel is cheap)
+    log("stream cancelled by user — tail not transcribed")
+    return {"ok": True, "cancelled": True}
+
+
+def stream_finish(polish: bool = True) -> dict:
+    """Stop tailing, transcribe the tail, then run the normal cleanup pipeline."""
+    global _stream
+    with _stream_lock:
+        session, _stream = _stream, None
+    if session is None:
+        return {"text": "", "reason": "no-stream"}
+
+    started = time.time()
+    result = session.finish()
+    merged = result.get("text") or ""
+    elapsed = time.time() - started
+
+    # The per-segment text is raw; gates and cleanup work better on the whole.
+    payload = {"raw": merged, "segments": result.get("segments", 0),
+               "tailMs": int(elapsed * 1000), "backend": BACKEND.describe()}
+    if not merged.strip():
+        payload.update({"text": "", "reason": "silence"})
+        return payload
+    if is_hallucination(merged, None):
+        payload.update({"text": "", "reason": "hallucination"})
+        return payload
+    text = clean(merged) if polish else merged
+    if polish:
+        text = apply_vocabulary(text, vocabulary())
+    if not has_speech(text):
+        payload.update({"text": "", "reason": "no-words"})
+        return payload
+    payload["text"] = text
+    log(f"stream finished: {result.get('segments')} segments, tail {int(elapsed*1000)}ms, {len(text)} chars")
+    return payload
+
+
 class Handler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         line = self.rfile.readline()
@@ -243,6 +323,16 @@ class Handler(socketserver.StreamRequestHandler):
             if cmd == "ping":
                 self._reply({"ok": True, "model": BACKEND.describe(),
                              "backend": BACKEND.name, "warm": _model_loaded})
+            elif cmd == "stream_start":
+                self._reply(stream_start(request["wav"], request.get("language", "zh")))
+            elif cmd == "stream_state":
+                self._reply(stream_state())
+            elif cmd == "stream_cancel":
+                self._reply(stream_cancel())
+            elif cmd == "stream_finish":
+                payload = stream_finish(request.get("polish", True))
+                payload["ok"] = True
+                self._reply(payload)
             elif cmd == "transcribe":
                 payload = transcribe(
                     request["wav"],

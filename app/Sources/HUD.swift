@@ -9,7 +9,7 @@ final class HUD {
     private var dismiss: DispatchWorkItem?
     private var lastLevelAt = Date.distantPast
 
-    private let size = NSSize(width: 300, height: 54)
+    private let size = NSSize(width: 430, height: 82)
 
     func prepare() {
         panel = NSPanel(contentRect: NSRect(origin: .zero, size: size),
@@ -44,6 +44,15 @@ final class HUD {
         panel.alphaValue = 1
         panel.orderFrontRegardless()
         startTicker()
+    }
+
+    /// Live text from the streaming engine, shown under the level bars.
+    func pushPartial(_ text: String) {
+        guard view.mode == .listening else { return }
+        view.partial = text
+        var levels = view.levels
+        if levels.isEmpty { levels = [Float](repeating: 0, count: 26) }
+        view.levels = levels
     }
 
     func pushLevel(_ rms: Float) {
@@ -113,6 +122,7 @@ final class HUDView: NSView {
 
     var mode: Mode = .listening { didSet { needsDisplay = true } }
     var message: String = "" { didSet { needsDisplay = true } }
+    var partial: String = "" { didSet { needsDisplay = true } }
     var levels: [Float] = [] { didSet { needsDisplay = true } }
 
     override var isFlipped: Bool { false }
@@ -148,12 +158,14 @@ final class HUDView: NSView {
     private func drawBars() {
         let iconSize: CGFloat = 20
         let iconX: CGFloat = 16
+        let rowTop = bounds.height - 30          // 上面一行放电平条，下面一行放实时文字
+        let rowMid = rowTop + 14
         NSColor.white.withAlphaComponent(0.85).set()
 
         if let image = NSImage(systemSymbolName: "mic.fill", accessibilityDescription: "mic") {
             let configured = image.withSymbolConfiguration(
                 NSImage.SymbolConfiguration(pointSize: iconSize, weight: .semibold))
-            let rect = NSRect(x: iconX, y: bounds.midY - 10, width: 16, height: 20)
+            let rect = NSRect(x: iconX, y: rowMid - 10, width: 16, height: 20)
             configured?.draw(in: rect, from: .zero, operation: .sourceOver, fraction: 1.0)
         }
 
@@ -164,7 +176,7 @@ final class HUDView: NSView {
         ]
         let hintSize = (hint as NSString).size(withAttributes: hintAttributes)
         let hintX = bounds.width - hintSize.width - 14
-        (hint as NSString).draw(at: NSPoint(x: hintX, y: bounds.midY - hintSize.height / 2),
+        (hint as NSString).draw(at: NSPoint(x: hintX, y: rowMid - hintSize.height / 2),
                                 withAttributes: hintAttributes)
 
         let barWidth: CGFloat = 3
@@ -173,10 +185,10 @@ final class HUDView: NSView {
         let available = bounds.width - startX - hintSize.width - 30
         let maxBars = max(1, Int((available + gap) / (barWidth + gap)))
         let shown = Array(levels.suffix(maxBars))
-        let maxHeight = bounds.height - 20
+        let maxHeight: CGFloat = 34
         let totalWidth = CGFloat(shown.count) * (barWidth + gap) - gap
         var x = startX + (available - totalWidth) / 2
-        let mid = bounds.midY
+        let mid = rowMid
 
         for (index, level) in shown.enumerated() {
             let height = max(3, CGFloat(level) * maxHeight)
@@ -189,5 +201,23 @@ final class HUDView: NSView {
             NSBezierPath(roundedRect: rect, xRadius: barWidth / 2, yRadius: barWidth / 2).fill()
             x += barWidth + gap
         }
+
+        drawPartialText()
+    }
+
+    /// The newest text is the interesting part, so truncate at the head rather
+    /// than the tail — otherwise a long utterance shows only its beginning.
+    private func drawPartialText() {
+        let shown = partial.isEmpty ? "聆听中…" : partial
+        let style = NSMutableParagraphStyle()
+        style.lineBreakMode = .byTruncatingHead
+        style.alignment = .left
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 11.5, weight: .regular),
+            .foregroundColor: NSColor.white.withAlphaComponent(partial.isEmpty ? 0.45 : 0.92),
+            .paragraphStyle: style,
+        ]
+        let rect = NSRect(x: 16, y: 10, width: bounds.width - 32, height: 16)
+        (shown as NSString).draw(in: rect, withAttributes: attributes)
     }
 }

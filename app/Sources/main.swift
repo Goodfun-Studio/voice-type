@@ -80,6 +80,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// never be pasted into whatever the user is doing now.
     private var generation = 0
     private var cancelledGeneration = -1
+    /// Streaming state: the engine transcribes while we are still recording, so
+    /// the wait after the user stops is short and constant instead of growing
+    /// with how long they talked.
+    private var streamTimer: Timer?
+    private var streamingActive = false
+    private var pollInFlight = false
     private var trustTimer: Timer?
 
     private static let openSettingsNotification = Notification.Name("com.goodfunstudio.voicetype.openSettings")
@@ -262,6 +268,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func startStreamPolling() {
+        streamTimer?.invalidate()
+        streamTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+            guard let self, self.state == .recording, !self.pollInFlight else { return }
+            self.pollInFlight = true
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                let state = self.engine.streamState()
+                self.pollInFlight = false
+                guard let partial = state?["partial"] as? String, !partial.isEmpty else { return }
+                DispatchQueue.main.async { self.hud.pushPartial(partial) }
+            }
+        }
+    }
+
+    private func stopStreamPolling() {
+        streamTimer?.invalidate()
+        streamTimer = nil
+    }
+
     private func beginRecordingWindow() {
         // Esc is registered only for the few seconds we are recording, so the
         // rest of the system keeps its Esc key untouched.
@@ -289,8 +315,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         targetApp = NSWorkspace.shared.frontmostApplication
+        let wavURL: URL?
         do {
-            _ = try recorder.start()
+            wavURL = try recorder.start()
         } catch {
             logLine("record failed: \(error)")
             hud.toast("录音启动失败：麦克风权限？")
@@ -303,6 +330,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state = .recording
         beginRecordingWindow()
         hud.showListening()
+
+        // Start streaming right away: the engine tails the WAV we are writing.
+        if let wavURL {
+            streamingActive = engine.streamStart(wav: wavURL.path, language: config.language)
+            if streamingActive { startStreamPolling() }
+        } else {
+            streamingActive = false
+        }
         refreshStatus()
         if config.sound { NSSound(named: "Tink")?.play() }
     }
@@ -329,30 +364,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let myGeneration = generation
         let language = config.language == "auto" ? nil : config.language
+        let usedStream = streamingActive
+        streamingActive = false
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            do {
-                let result = try self.engine.transcribe(wav: wav.path, language: language)
-                let text = (result["text"] as? String) ?? ""
-                let ms = (result["elapsedMs"] as? Int) ?? 0
-                DispatchQueue.main.async {
-                    if self.cancelledGeneration == myGeneration {
-                        logLine("result of take \(myGeneration) discarded after cancel: \(text.prefix(30))")
-                    } else {
-                        self.deliver(text, ms: ms)
-                    }
-                    self.discard(wav)
-                    self.state = .idle
-                    self.refreshStatus()
+            var text = ""
+            var elapsed = 0
+            var handled = false
+
+            if usedStream {
+                do {
+                    let payload = try self.engine.streamFinish(language: language)
+                    text = (payload["text"] as? String) ?? ""
+                    elapsed = (payload["tailMs"] as? Int) ?? 0
+                    logLine("stream tail done: \(payload["segments"] ?? 0) segments, \(elapsed)ms, \(text.count) chars")
+                    handled = true
+                } catch {
+                    logLine("streamFinish failed: \(error.localizedDescription) — falling back")
                 }
-            } catch {
-                logLine("transcribe failed: \(error)")
-                DispatchQueue.main.async {
-                    self.discard(wav)
-                    if self.cancelledGeneration != myGeneration { self.hud.toast("转写失败") }
-                    self.state = .idle
-                    self.refreshStatus()
+            }
+            if !handled {
+                do {
+                    let result = try self.engine.transcribe(wav: wav.path, language: language)
+                    text = (result["text"] as? String) ?? ""
+                    elapsed = (result["elapsedMs"] as? Int) ?? 0
+                } catch {
+                    logLine("transcribe failed: \(error)")
                 }
+            }
+
+            DispatchQueue.main.async {
+                if self.cancelledGeneration == myGeneration {
+                    logLine("result of take \(myGeneration) discarded after cancel: \(text.prefix(30))")
+                } else if text.isEmpty {
+                    self.hud.toast("没听到内容")
+                    NSSound(named: "Basso")?.play()
+                } else {
+                    self.deliver(text, ms: elapsed)
+                }
+                self.discard(wav)
+                self.state = .idle
+                self.refreshStatus()
             }
         }
     }
@@ -364,6 +417,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .recording:
             cancelledGeneration = generation
             endRecordingWindow()
+            stopStreamPolling()
+            if streamingActive {
+                engine.streamCancel()      // drop it without transcribing the tail
+                streamingActive = false
+            }
             discard(recorder.stop())
             state = .idle
             refreshStatus()

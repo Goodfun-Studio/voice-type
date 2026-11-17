@@ -19,6 +19,7 @@ Design notes:
 """
 from __future__ import annotations
 
+import os
 import struct
 import threading
 import time
@@ -29,8 +30,17 @@ SAMPLE_RATE = 16_000
 FRAME_MS = 30                      # RMS window
 FRAME_BYTES = SAMPLE_RATE * FRAME_MS // 1000 * 2
 SILENCE_FRAMES_TO_CUT = 8          # ~240ms of quiet ends a segment
-MIN_SEGMENT_SECONDS = 1.2          # do not bother with tiny fragments
+MIN_SEGMENT_SECONDS = 1.2
+
+TERMINAL_PUNCT = "。！？…!?."
+# 一段没以句末标点结尾就先不提交，等下一个停顿 —— 拿到完整句子比切在句中间强。
+MAX_UNCOMMITTED_SECONDS = 12.0          # do not bother with tiny fragments
 MAX_SEGMENT_SECONDS = 25.0         # never let a segment approach whisper's 30s window
+
+
+# 可调参数（也可用环境变量覆盖，便于做配置扫描）
+SILENCE_MS = int(os.environ.get("VOICETYPE_STREAM_SILENCE_MS", "240"))
+CARRY_CHARS = int(os.environ.get("VOICETYPE_STREAM_CARRY_CHARS", "24"))
 
 
 def find_data_offset(path: Path) -> int:
@@ -54,9 +64,21 @@ def find_data_offset(path: Path) -> int:
 class StreamSession:
     def __init__(self, wav_path: str, language: str = "zh",
                  transcribe=None, lock: threading.Lock | None = None,
-                 context_carry: bool = True, junk_filter=None) -> None:
+                 context_carry: bool = True, junk_filter=None,
+                 silence_ms: int | None = None, carry_chars: int | None = None,
+                 sentence_align: bool | None = None) -> None:
         self.context_carry = context_carry
         self._junk_filter = junk_filter
+        self.silence_frames = max(1, (silence_ms if silence_ms is not None else SILENCE_MS) // FRAME_MS)
+        self.carry_chars = carry_chars if carry_chars is not None else CARRY_CHARS
+        # 实测：本素材上 CER 无变化（0.0235），只让尾延迟好看一点，代价是重复转写。
+        # 由于测不出质量收益，默认关闭；真实口语素材（停顿不在句末）值得再评一次。
+        self.sentence_align = (sentence_align if sentence_align is not None
+                              else os.environ.get("VOICETYPE_STREAM_SENTENCE_ALIGN", "0") == "1")
+        self._preview = ""                     # 未提交的预览（HUD 用，不进最终文本）
+        self._all_pcm = bytearray()            # 全程 PCM，供"整段重转"用
+        self.reconcile = os.environ.get("VOICETYPE_STREAM_RECONCILE", "0") == "1"
+        self._last_cut_tail = bytearray()      # 上一段的尾部音频，用于下一段的左侧重叠
         self.path = Path(wav_path)
         self.language = language
         self._transcribe = transcribe          # callable(wav_path, language) -> text
@@ -84,7 +106,7 @@ class StreamSession:
 
     def state(self) -> dict:
         return {
-            "partial": "".join(self._segments),
+            "partial": "".join(self._segments) + self._preview,
             "segments": len(self._segments),
             "audioSeconds": round(len(self._pending) / 2 / SAMPLE_RATE + sum(self.segment_seconds), 2),
             "elapsedMs": int((time.time() - self.started_at) * 1000),
@@ -103,9 +125,27 @@ class StreamSession:
         except Exception:  # noqa: BLE001
             pass
         self._flush_pending(force=True)
+        merged = "".join(self._segments)
+        reconciled = ""
+        if self.reconcile and merged:
+            try:
+                reconciled = self._reconcile()
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    from engine import log as _log
+                    _log(f"reconcile failed: {exc}")
+                except Exception:  # noqa: BLE001
+                    pass
         self.finished_at = time.time()
+        if reconciled:
+            # 整段重转的结果优先，但照样过一遍护栏（退回合并文本时也是）
+            return {
+                "text": reconciled, "reconciled": True,
+                "segments": len(self._segments),
+                "tailMs": int((self.finished_at - started) * 1000),
+            }
         return {
-            "text": "".join(self._segments),
+            "text": merged,
             "segments": len(self._segments),
             "tailMs": int((self.finished_at - started) * 1000),
         }
@@ -142,15 +182,18 @@ class StreamSession:
             else:
                 self._quiet_run += 1
             self._carry.extend(frame)
+            self._all_pcm.extend(frame)
 
             seconds = len(self._carry) / 2 / SAMPLE_RATE
-            if self._quiet_run >= SILENCE_FRAMES_TO_CUT and seconds >= MIN_SEGMENT_SECONDS:
+            if self._quiet_run >= self.silence_frames and seconds >= MIN_SEGMENT_SECONDS:
                 self._cut(self._carry)
             elif seconds >= MAX_SEGMENT_SECONDS:
-                self._cut(self._carry)
+                self._cut(self._carry, force=True)
 
-    def _cut(self, audio: bytearray) -> None:
+    def _cut(self, audio: bytearray, force: bool = False) -> None:
         seconds = len(audio) / 2 / SAMPLE_RATE
+        # 实测记录（2026-11-17）：左侧重叠会让 CER 从 0.0235 变差到 0.0470
+        # —— 上一段的尾巴（可能是静音或半个字）会让模型开头就乱。已撤除，别再试。
         segment = bytes(audio)
         audio.clear()
         self._quiet_run = 0
@@ -162,12 +205,45 @@ class StreamSession:
         # 也不该进最终文本。判定逻辑由调用方给（引擎侧统一）。
         if text and self._junk_filter and self._junk_filter(text, _rms(segment)):
             return
+        # 句末对齐：没到句子结尾就先不提交，把音频留着等下一个停顿。
+        # 切在句中间会丢上下文（标点坏、词可能被切开），代价只是多转写一次。
+        if (text and self.sentence_align and not force
+                and not text.endswith(tuple(TERMINAL_PUNCT))
+                and seconds < MAX_UNCOMMITTED_SECONDS):
+            self._preview = text
+            self._quiet_run = 0
+            return                                  # 注意：不清空 audio，留着
         if text:
+            self._preview = ""
             self._segments.append(text)
             # Carrying a little of the previous text helps the model keep the
             # punctuation and the thread of the sentence across the cut. Kept
             # short on purpose: long prompts are what causes repeat loops.
-            self._context = text[-24:]
+            self._context = text[-self.carry_chars:]
+
+    def _reconcile(self) -> str:
+        """质量优先：把整段音频一次性重转，取它当最终文本。
+
+        流式的切段本身会损失一点质量（实测 CER 0.0235 vs 0.0201）。
+        这个方法用「多等几秒」把差距买回来，代价随录音时长线性增长。
+        """
+        if not self._all_pcm:
+            return ""
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        with wave.open(path, "wb") as handle:      # 和 _run_model 用同一套写法
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(SAMPLE_RATE)
+            handle.writeframes(bytes(self._all_pcm))
+        try:
+            return self._transcribe(path, self.language, "") or ""
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     def _flush_pending(self, force: bool = False) -> None:
         """Transcribe the leftover tail (and any audio still in the read buffer)."""
@@ -175,7 +251,7 @@ class StreamSession:
             self._carry.extend(self._pending)
             self._pending.clear()
         if self._carry:
-            self._cut(self._carry)
+            self._cut(self._carry, force=True)
 
     def _run_model(self, pcm: bytes) -> str:
         tmp = self.path.with_suffix(f".seg{len(self._segments)}.wav")

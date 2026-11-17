@@ -310,6 +310,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startRecording() {
+        // Never open a second recording on top of a live one: the extra tap
+        // would be installed on a busy bus and AVFoundation would abort the
+        // process. The state machine should make this impossible — this is the
+        // belt-and-braces check.
+        guard state == .idle else {
+            logLine("start ignored: state=\(state)")
+            return
+        }
         guard engineReady else {
             hud.toast("引擎还没起来")
             return
@@ -395,6 +403,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             DispatchQueue.main.async {
+                self.discard(wav)
+                // A take that is no longer current must not touch shared state.
+                // This is the bug that killed the app: a cancelled take's late
+                // result flipped state to .idle while a *newer* take was still
+                // recording, and the next trigger then started a second
+                // recording on top of the live one.
+                guard myGeneration == self.generation else {
+                    logLine("stale result of take \(myGeneration) ignored (current \(self.generation)): \(text.prefix(30))")
+                    return
+                }
                 if self.cancelledGeneration == myGeneration {
                     logLine("result of take \(myGeneration) discarded after cancel: \(text.prefix(30))")
                 } else if text.isEmpty {
@@ -403,7 +421,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 } else {
                     self.deliver(text, ms: elapsed)
                 }
-                self.discard(wav)
                 self.state = .idle
                 self.refreshStatus()
             }

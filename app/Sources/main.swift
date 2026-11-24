@@ -25,7 +25,7 @@ enum Paths {
 func logLine(_ s: String) {
     // Single writer only: launchd already redirects our stderr into this same
     // file, and two writers interleaving mid-line corrupted the log.
-    let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+    let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm:ss"   // 必须有日期：两个写入者共用此文件，没有日期没法判断行属于哪一天
     let text = "[\(f.string(from: Date()))] \(s)\n"
     let fd = open(Paths.log.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
     guard fd >= 0 else { return }
@@ -80,12 +80,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// never be pasted into whatever the user is doing now.
     private var generation = 0
     private var cancelledGeneration = -1
-    /// Streaming state: the engine transcribes while we are still recording, so
-    /// the wait after the user stops is short and constant instead of growing
-    /// with how long they talked.
-    private var streamTimer: Timer?
-    private var streamingActive = false
-    private var pollInFlight = false
     private var trustTimer: Timer?
 
     private static let openSettingsNotification = Notification.Name("com.goodfunstudio.voicetype.openSettings")
@@ -268,26 +262,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func startStreamPolling() {
-        streamTimer?.invalidate()
-        streamTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
-            guard let self, self.state == .recording, !self.pollInFlight else { return }
-            self.pollInFlight = true
-            DispatchQueue.global(qos: .utility).async { [weak self] in
-                guard let self else { return }
-                let state = self.engine.streamState()
-                self.pollInFlight = false
-                guard let partial = state?["partial"] as? String, !partial.isEmpty else { return }
-                DispatchQueue.main.async { self.hud.pushPartial(partial) }
-            }
-        }
-    }
-
-    private func stopStreamPolling() {
-        streamTimer?.invalidate()
-        streamTimer = nil
-    }
-
     private func beginRecordingWindow() {
         // Esc is registered only for the few seconds we are recording, so the
         // rest of the system keeps its Esc key untouched.
@@ -339,13 +313,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         beginRecordingWindow()
         hud.showListening()
 
-        // Start streaming right away: the engine tails the WAV we are writing.
-        if let wavURL {
-            streamingActive = engine.streamStart(wav: wavURL.path, language: config.language)
-            if streamingActive { startStreamPolling() }
-        } else {
-            streamingActive = false
-        }
+        // 一次性转写：不做流式（2026-11-24 回滚）。实测真实使用环境下流式反而退化成
+        // 20-35 秒尾延迟 + 碎片化输出 —— 见 README「流式为什么被停用」。
         refreshStatus()
         if config.sound { NSSound(named: "Tink")?.play() }
     }
@@ -372,34 +341,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let myGeneration = generation
         let language = config.language == "auto" ? nil : config.language
-        let usedStream = streamingActive
-        streamingActive = false
-
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             var text = ""
             var elapsed = 0
-            var handled = false
-
-            if usedStream {
-                do {
-                    let payload = try self.engine.streamFinish(language: language)
-                    text = (payload["text"] as? String) ?? ""
-                    elapsed = (payload["tailMs"] as? Int) ?? 0
-                    logLine("stream tail done: \(payload["segments"] ?? 0) segments, \(elapsed)ms, \(text.count) chars")
-                    handled = true
-                } catch {
-                    logLine("streamFinish failed: \(error.localizedDescription) — falling back")
-                }
-            }
-            if !handled {
-                do {
-                    let result = try self.engine.transcribe(wav: wav.path, language: language)
-                    text = (result["text"] as? String) ?? ""
-                    elapsed = (result["elapsedMs"] as? Int) ?? 0
-                } catch {
-                    logLine("transcribe failed: \(error)")
-                }
+            do {
+                let result = try self.engine.transcribe(wav: wav.path, language: language)
+                text = (result["text"] as? String) ?? ""
+                elapsed = (result["elapsedMs"] as? Int) ?? 0
+            } catch {
+                logLine("transcribe failed: \(error)")
             }
 
             DispatchQueue.main.async {
@@ -434,11 +385,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .recording:
             cancelledGeneration = generation
             endRecordingWindow()
-            stopStreamPolling()
-            if streamingActive {
-                engine.streamCancel()      // drop it without transcribing the tail
-                streamingActive = false
-            }
             discard(recorder.stop())
             state = .idle
             refreshStatus()

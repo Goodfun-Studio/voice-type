@@ -1,5 +1,19 @@
 """Transcribe a WAV that is still being recorded.
 
+⚠️ 已停用（2026-11-24）—— app 侧不再调用本模块。
+
+停用原因（boss 实测一周的真实数据，不是理论推演）：
+  · 尾延迟反而退化成 20-35 秒（设计目标是 1.2 秒）：录音期间要一边转写一边
+    跟随文件，机器一忙（他会同时跑 Claude Code 等）就追不上，积压全部堆到收尾
+  · 输出碎片化："好。好。挥直。先按照你的建议回在消息线程里看看效果。" /
+    "爆400的人。把4600解了。" —— 短段落丢上下文，质量明显低于一次性整段
+  · 我当初的基准测试是在**空载机器 + 干净 TTS 素材**上做的（CER 0.0235 vs 0.0201），
+    那个条件不代表真实使用 —— 这是本次判断失误的根源
+
+结论：本地 whisper 的固定 30 秒窗口成本，换不来"边说边出字"的收益；
+一次性整段在真实环境下又快又准。代码保留供日后评估，但**默认不要打开**。
+
+
 The app writes its recording to a file as it goes; this polls that file, cuts it
 at *silence* boundaries, and transcribes each finished piece while the user is
 still talking. When the user stops, only the tail is left to transcribe — so the

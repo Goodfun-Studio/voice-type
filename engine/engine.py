@@ -104,7 +104,7 @@ _model_loaded = False
 
 
 def log(message: str) -> None:
-    stamp = time.strftime("%H:%M:%S")
+    stamp = time.strftime("%m-%d %H:%M:%S")   # 带日期：本文件与 app 共用，没有日期无法判断行属于哪一天
     print(f"[{stamp}] {message}", flush=True)
 
 
